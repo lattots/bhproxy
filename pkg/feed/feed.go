@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -41,6 +43,10 @@ type Post struct {
 }
 
 func GetFeedWithID(db *sql.DB, id string) (*Feed, error) {
+	if !isAllowedFeedId(id) {
+		return nil, fmt.Errorf("given feed id %s is not in the whitelist", id)
+	}
+
 	feed := &Feed{ID: id}
 
 	err := feed.fetchOrCreateFeed(db)
@@ -57,6 +63,19 @@ func GetFeedWithID(db *sql.DB, id string) (*Feed, error) {
 	go feed.removeDeprecatedPosts(db)
 
 	return feed, nil
+}
+
+func isAllowedFeedId(feedID string) bool {
+	allowedFeedIdsStr := os.Getenv("BHP_ALLOWED_FEED_IDS")
+	allowedFeedIdsStrWithoutSpaces := strings.ReplaceAll(allowedFeedIdsStr, " ", "")
+
+	if allowedFeedIdsStrWithoutSpaces == "" {
+		return true
+	}
+
+	allowedFeedIds := strings.Split(allowedFeedIdsStrWithoutSpaces, ",")
+
+	return slices.Contains(allowedFeedIds, feedID)
 }
 
 func (f *Feed) fetchOrCreateFeed(db *sql.DB) error {
@@ -167,19 +186,33 @@ func (f *Feed) insertToDB(db *sql.DB) error {
 	return nil
 }
 
-const (
-	imgDirPath = "data/img/"             // imgDirPath is filepath prefix for image directory
-	urlPrefix  = "https://media.foo.com" // urlPrefix is prefix for root url path. It can be used to access other resources like images
-)
+func getImageDirectory() (string, error) {
+	imageDirectory := os.Getenv("BHP_IMAGE_DIRECTORY")
+	if imageDirectory == "" {
+		return "", errors.New("required environment variable image_directory is not set or is empty")
+	}
+
+	return imageDirectory, nil
+}
+
+func getImageURL() string {
+	return os.Getenv("BHP_IMAGE_URL")
+}
 
 func ensurePostImagesExist(db *sql.DB, postIDs []string) ([]string, error) {
 	internalURLs := make([]string, len(postIDs))
+	imageDirectory, err := getImageDirectory()
+	if err != nil {
+		return nil, fmt.Errorf("failed to check image file: %w", err)
+	}
+
 	for i, postID := range postIDs {
-		filePath := filepath.Join(imgDirPath, postID+".webp")
-		internalURLs[i] = fmt.Sprintf("%s/%s", urlPrefix, filePath)
+		fileNameMediaSmall := postID + ".webp"
+		filePathMediaSmall := filepath.Join(imageDirectory, fileNameMediaSmall)
+		internalURLs[i] = fmt.Sprintf("%s/%s", getImageURL(), fileNameMediaSmall)
 
 		// If the image exists, skip download
-		if _, err := os.Stat(filePath); err == nil {
+		if _, err := os.Stat(filePathMediaSmall); err == nil {
 			continue
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("failed to check image file: %w", err)
@@ -192,7 +225,7 @@ func ensurePostImagesExist(db *sql.DB, postIDs []string) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("error getting images external url: %w", err)
 		}
-		err = downloadImage(filePath, dlURL)
+		err = downloadImage(filePathMediaSmall, dlURL)
 		if err != nil {
 			return nil, fmt.Errorf("error downloading image: %w", err)
 		}
@@ -218,7 +251,7 @@ func getImageExternalURL(db *sql.DB, postID string) (string, error) {
 }
 
 // downloadImage downloads the image from external source and saves it to image directory with filename:
-// ./imgDirPath/IMAGE_ID.webp
+// image-directory/IMAGE_ID.webp
 func downloadImage(filePath, url string) error {
 	file, err := os.Create(filePath)
 	if err != nil {
@@ -318,6 +351,12 @@ func parseFeedRows(rows *sql.Rows, feed *Feed) error {
 }
 
 func (f *Feed) removeDeprecatedPosts(db *sql.DB) {
+	imageDirectory, err := getImageDirectory()
+	if err != nil {
+		log.Printf("could not remove deprecated posts: %w", err)
+		return
+	}
+
 	ids, err := f.getIrrelevantPosts(db)
 	if err != nil {
 		log.Printf("error getting post ids for feed %s: %s", f.ID, err)
@@ -335,7 +374,7 @@ func (f *Feed) removeDeprecatedPosts(db *sql.DB) {
 	}
 
 	for _, postID := range ids {
-		filePath := filepath.Join(imgDirPath, postID+".webp")
+		filePath := filepath.Join(imageDirectory, postID+".webp")
 		// check if file already doesn't exist
 		if _, err := os.Stat(filePath); err != nil {
 			continue
